@@ -1,0 +1,155 @@
+RELATÓRIO DO PROJETO PDV — 26/10/2026
+======================================================================
+Método: leitura do código + execução real (py_compile, ruff, mypy --strict
+e um teste do fluxo de venda em SQLite em memória).
+Resultado geral: o código compila e a arquitetura em camadas
+(models / repositories / services / main) está correta. Os problemas estão
+na regra de negócio, na tipagem e no ambiente.
+
+Obs.: o RELATORIO_PROJETO.txt antigo (23/10) está desatualizado. Os erros
+de sintaxe e o relacionamento ItemVenda.produto citados nele já foram
+corrigidos.
+
+
+1. ERROS DE LÓGICA (confirmados executando o código)
+----------------------------------------------------------------------
+1.1 Estoque fica negativo
+    Onde: services/caixa.py:15
+    Causa: a checagem compara o estoque só com a quantidade do item atual,
+    sem somar o que já está no carrinho. Com estoque = 1, bipar o mesmo
+    produto 2 vezes passa nas duas checagens -> estoque final = -1.
+    Solução: somar a quantidade já reservada antes de comparar:
+        ja_no_carrinho = sum(qtd for prod, qtd in self.itens if prod.id == produto.id)
+        if produto.estoque_atual < ja_no_carrinho + quantidade: raise ...
+
+1.2 Quantidade zero ou negativa é aceita
+    Onde: services/caixa.py:11
+    Teste: adicionar_item("1", quantidade=-5) gerou total de R$ -50,00.
+    Solução: validar no início -> if quantidade <= 0: raise ValueError(...)
+    e reforçar no banco com CheckConstraint("quantidade > 0").
+
+1.3 Programa quebra ao finalizar sem itens
+    Onde: main.py:19
+    Causa: digitar "f" logo de cara chama finalizar(), que lança
+    ValueError("Venda vazia.") FORA do try -> traceback e o programa morre.
+    Solução: tratar o erro ou só finalizar se houver itens.
+
+1.4 Remover produto que já foi vendido estoura IntegrityError
+    Onde: repositories/produto_repo.py:17
+    Causa: ao deletar o Produto, o SQLAlchemy tenta colocar NULL em
+    itens_venda.produto_id, que é NOT NULL. Teste confirmou o erro.
+    Conceito: histórico de venda nunca deve ser apagado.
+    Solução: "exclusão lógica" (soft delete): coluna ativo = Boolean e
+    marcar ativo=False em vez de session.delete(). Também não use print()
+    no repositório; retorne o valor ou lance exceção e deixe a interface
+    decidir o que exibir.
+
+1.5 Condição de corrida (race condition) no estoque
+    Onde: repositories/produto_repo.py:12
+    Causa: "ler estoque -> subtrair em Python -> gravar". Dois caixas
+    vendendo o mesmo produto ao mesmo tempo podem sobrescrever um ao outro.
+    Solução: deixar o banco fazer a operação de forma atômica:
+        UPDATE produtos SET estoque_atual = estoque_atual - :qtd
+        WHERE id = :id AND estoque_atual >= :qtd
+    (ou SELECT ... FOR UPDATE com .with_for_update()). Se 0 linhas forem
+    afetadas, falta estoque -> rollback.
+
+1.6 Outros pontos de fluxo em main.py
+    - forma_pagamento fixa em "dinheiro" (linha 19): pedir ao operador.
+    - "F" maiúsculo não finaliza: use codigo.lower() == "f".
+    - Ctrl+C / Ctrl+D (KeyboardInterrupt / EOFError) derrubam o programa
+      sem mensagem.
+    - Erros de banco (SQLAlchemyError) não são tratados.
+    - Mesmo produto bipado várias vezes vira várias linhas de ItemVenda;
+      agrupe por produto antes de gravar.
+
+
+2. MODELAGEM DO BANCO (models/)
+----------------------------------------------------------------------
+2.1 Sem restrições de integridade (CheckConstraint) para preco >= 0,
+    estoque_atual >= 0 e quantidade > 0. A validação deve existir no
+    código E no banco (defesa em profundidade).
+2.2 data_hora usa default=datetime.now (venda.py:10): hora do cliente e
+    sem fuso. Prefira DateTime(timezone=True) com server_default=func.now().
+2.3 forma_pagamento é texto livre: aceita "dinhero", "Pix", "pix".
+    Use um Enum (Python enum.Enum + sqlalchemy.Enum).
+2.4 declarative_base() e Column() são o estilo legado do SQLAlchemy 1.x.
+    No 2.0 use class Base(DeclarativeBase) e Mapped[...]/mapped_column().
+    Isso também resolve os erros do mypy "Class cannot subclass Base".
+2.5 Código comentado de Categoria (produto.py:13-22) está errado se for
+    reativado: a FK aponta para "categorias" mas a tabela se chama
+    "categoria", e o relationship aponta para a própria classe. Corrija ou
+    remova; código morto confunde.
+2.6 Base.metadata.create_all() roda no import de main.py e não há Alembic
+    configurado (falta alembic.ini/migrations), apesar de instalado.
+    Rode "alembic init migrations" e gere as tabelas por migração.
+
+
+3. AMBIENTE E CONFIGURAÇÃO
+----------------------------------------------------------------------
+3.1 Existem DOIS ambientes virtuais:
+    - .venv/ (Python 3.12): funciona, tem todas as dependências.
+    - venv/  (criado com Python 3.13): quebrado, sem sqlalchemy.
+    Solução: usar só o .venv/ e excluir o venv/ antigo.
+3.2 Falta requirements-dev.txt (ou seção dev) com pytest, ruff e mypy.
+3.3 Não há pyproject.toml configurando ruff e mypy --strict.
+3.4 Não há .gitignore nem repositório git (o projeto não é versionado).
+    __pycache__/ e os venvs não devem ser versionados.
+3.5 models/base.py lança RuntimeError no import se PDV_DATABASE_URL não
+    existir. É bom não ter senha no código, mas efeito colateral no import
+    impede testar os módulos isoladamente. Mova a criação do engine para
+    uma função (ex.: criar_engine()).
+
+
+4. QUALIDADE DE CÓDIGO (ruff / mypy / regras do CLAUDE.md)
+----------------------------------------------------------------------
+4.1 mypy --strict: 21 erros. Nenhuma função tem type hints.
+    Exemplo de correção:
+        def adicionar_item(self, codigo_barras: str, quantidade: int = 1) -> Produto:
+        def total(self) -> Decimal:
+        def finalizar(self, forma_pagamento: str) -> Venda:
+        def __init__(self, session: Session) -> None:
+4.2 ruff: 30 avisos (18 de anotação, 12 corrigíveis com "ruff check --fix"):
+    imports fora de ordem, "import a, b" na mesma linha (main.py:2),
+    ForeignKey importado e não usado (produto.py:1), arquivos sem quebra
+    de linha final, espaço em linha vazia (produto_repo.py:23),
+    back_populates ="produto" com espaço fora do padrão (produto.py:14).
+4.3 Nomes de uma letra / abreviados (proibidos no seu CLAUDE.md):
+    p, q (caixa.py:21), e e p (main.py:15-17), qtd (caixa.py:28).
+    Troque por produto, quantidade, erro.
+4.4 self.itens é uma lista de tuplas (produto, quantidade): difícil de ler.
+    Use um @dataclass ItemCarrinho(produto: Produto, quantidade: int).
+4.5 Import dentro da função (main.py:8) sem necessidade: suba para o topo.
+4.6 Repositório faz commit() (produto_repo.py:18). Quem controla a
+    transação deve ser o serviço (padrão Unit of Work); o repositório só
+    lê/escreve na sessão.
+
+
+5. TESTES
+----------------------------------------------------------------------
+Não existe nenhum teste. Crie tests/ com pytest usando SQLite em memória
+("sqlite://") via fixture de sessão. Testes mínimos:
+    - produto inexistente lança ValueError
+    - estoque não pode ficar negativo (bug 1.1)
+    - quantidade <= 0 é rejeitada (bug 1.2)
+    - finalizar grava Venda, ItemVenda e baixa o estoque
+    - finalizar vazio lança ValueError
+    - total() soma corretamente com Decimal
+
+
+6. FUNCIONALIDADES QUE FALTAM NUM PDV
+----------------------------------------------------------------------
+Cadastro de produtos (hoje só dá para inserir direto no banco), remover
+item / cancelar venda, informar quantidade no terminal, valor recebido e
+troco, abertura/fechamento de caixa, relatório de vendas do dia.
+
+
+7. ORDEM SUGERIDA DE CORREÇÃO
+----------------------------------------------------------------------
+ 1) Apagar venv/, criar .gitignore, git init, requirements-dev.txt.
+ 2) Escrever os testes do item 5 (eles vão falhar: isso prova os bugs).
+ 3) Corrigir bugs 1.1 a 1.4 até os testes passarem.
+ 4) Migrar models para Mapped/mapped_column + CheckConstraints + Enum.
+ 5) Adicionar type hints até "mypy --strict" passar; rodar "ruff check --fix".
+ 6) Configurar Alembic e remover o create_all do main.py.
+ 7) Tratar concorrência no estoque (1.5) e só então novas funcionalidades.

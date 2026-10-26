@@ -1,0 +1,13 @@
+# ambientes virtuais
+.venv/
+venv/
+
+# caches do Python e das ferramentas
+__pycache__/
+*.pyc
+.mypy_cache/
+.pytest_cache/
+.ruff_cache/
+
+# variáveis de ambiente locais (senha do banco)
+.env
